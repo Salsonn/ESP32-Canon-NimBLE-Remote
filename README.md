@@ -1,4 +1,38 @@
-[![Bluetooth Remote for Modern Canon Cameras](./.github/cover.jpg)](https://www.youtube.com/watch?v=mM_tIqrD_5A "ESP32 Canon BLE Remote Library Demo")
+# CanoNimBLE
+
+NimBLE port of [maxmacstn/ESP32-Canon-BLE-Remote](https://github.com/maxmacstn/ESP32-Canon-BLE-Remote)
+(itself a fork of tjhoff/BR-M5). Same BR-E1 protocol, same public API
+(class `CanonBLERemote`), built on NimBLE-Arduino instead of the classic
+ESP32 BLE stack.
+
+## Why port?
+
+On the ESP32-C3 the classic stack pins the CPU at 160 MHz with the radio
+active and never sleeps: a paired, idle remote draws 50–150 mA and runs hot.
+NimBLE sleeps between connection events. With the 1 s connection interval this
+port requests, expect roughly 10–25 mA connected-idle.
+
+## Power measures baked in
+
+- TX power capped at 0 dBm (`init()`)
+- Connection interval 400–800 (1.25 ms units) = 0.5–1 s, requested after every
+  connect; the camera may reject it, in which case negotiated params stay
+- No background scanning — the scanner only runs inside `pair()`
+- 10 s connect timeout so a powered-off camera fails fast
+
+## One-time migration from the classic-stack library
+
+The camera MAC is stored under the same NVS key (`cameraaddr`, namespace
+`nvs`), so the address carries over. BLE bonding, however, is per stack, so
+after flashing this port do **one long-press re-pair** with the camera.
+One-time only — afterwards boot auto-connects directly to the stored MAC.
+
+## Usage
+
+Same as the original: camera to Wireless Communication > Bluetooth Function >
+Remote. `init()` brings the stack up and loads the stored address; `connect()`
+links directly (no scan); `pair(scan_seconds)` scans and pairs; `trigger()` /
+`focus()` auto-reconnect if the link dropped.[![Bluetooth Remote for Modern Canon Cameras](./.github/cover.jpg)](https://www.youtube.com/watch?v=mM_tIqrD_5A "ESP32 Canon BLE Remote Library Demo")
 [Demo Video](https://www.youtube.com/watch?v=mM_tIqrD_5A)
 
 # ESP32 Canon BLE Remote Library
