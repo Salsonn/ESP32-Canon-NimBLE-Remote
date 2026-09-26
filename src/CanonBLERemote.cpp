@@ -25,8 +25,7 @@ uint32_t CanonClientCallbacks::onPassKeyDisplay(NimBLEConnInfo &connInfo) {
 
 void CanonClientCallbacks::onConfirmPasskey(NimBLEConnInfo &connInfo, uint32_t pin) {
     // Auto-accept. Do NOT vTaskDelay here: this runs on the NimBLE host task,
-    // and blocking it stalls all BLE processing (the classic stack's 5 s delay
-    // is not portable to NimBLE).
+    // and blocking it stalls all BLE processing.
     log_i("Confirm passkey %u -> accept", (unsigned)pin);
 }
 
@@ -77,7 +76,7 @@ void CanonBLERemote::init() {
     if (nvs.begin()) {
         String address = nvs.getString("cameraaddr");
         if (address.length() == 17) {
-            camera_address = NimBLEAddress(address.c_str());
+            camera_address = NimBLEAddress(address.c_str(), 0);   // 0 = public address type
             log_i("Paired camera address: %s", address.c_str());
         } else {
             log_i("No camera paired yet");
@@ -98,11 +97,8 @@ void CanonBLERemote::scan(unsigned int scan_duration) {
 }
 
 bool CanonBLERemote::handleAdvertised(const NimBLEAdvertisedDevice &adv) {
-    bool match = false;
-    for (int i = 0; i < adv.getAdvertisedServiceCount(); i++) {
-        if (adv.getServiceUUID(i).equals(SERVICE_UUID)) { match = true; break; }
-    }
-    if (!match && adv.getName().startsWith("Canon")) match = true;   // fallback
+    bool match = adv.isAdvertisingService(SERVICE_UUID);
+    if (!match && adv.getName().find("Canon") == 0) match = true;   // fallback
     if (match) {
         camera_address = adv.getAddress();
         ready_to_connect = true;
@@ -120,7 +116,7 @@ String CanonBLERemote::getPairedAddressString() {
 }
 
 bool CanonBLERemote::hasPairedCamera() {
-    return !camera_address.isEmpty();
+    return !camera_address.isNull();
 }
 
 /**
@@ -151,7 +147,8 @@ bool CanonBLERemote::pair(unsigned int scan_duration) {
             pRemoteCharacteristic_Pairing = pRemoteService->getCharacteristic(PAIRING_SERVICE);
             if (pRemoteCharacteristic_Pairing != nullptr) {
                 // Pairing payload: 0x03 followed by " name " (leading space replaced)
-                std::string name_ = " " + device_name + " ";
+                std::string name_ = device_name.c_str();   // Arduino String -> std::string
+                name_ = " " + name_ + " ";
                 std::vector<uint8_t> payload(name_.size());
                 payload[0] = 0x03;
                 for (size_t i = 1; i < name_.size(); i++) payload[i] = (uint8_t)name_[i];
@@ -185,7 +182,7 @@ bool CanonBLERemote::pair(unsigned int scan_duration) {
  * Used at boot and by trigger()/focus() auto-reconnect.
  */
 bool CanonBLERemote::connect() {
-    if (pclient == nullptr || camera_address.isEmpty()) return false;
+    if (pclient == nullptr || camera_address.isNull()) return false;
 
     if (pclient->connect(camera_address)) {
         // Slow the connection interval: radio heartbeats ~1-2x/s instead of
