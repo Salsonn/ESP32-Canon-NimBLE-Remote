@@ -5,77 +5,73 @@
 #include <NimBLEDevice.h>
 #include <ArduinoNvs.h>
 
-// Fires (from the NimBLE task) for every advertisement seen.
-class CanonScanCallbacks : public NimBLEScanCallbacks {
-private:
-    NimBLEUUID service_uuid_wanted;
-    bool *pready_to_connect;
-    NimBLEAddress *paddress_to_connect;
-public:
-    CanonScanCallbacks(NimBLEUUID service_uuid, bool *ready, NimBLEAddress *address);
-    void onResult(NimBLEAdvertisedDevice *advertisedDevice) override;
-};
+class CanonBLERemote;
 
-// Connection-state tracking.
+// Tracks client connection state (replaces the classic stack's ConnectivityState)
 class CanonClientCallbacks : public NimBLEClientCallbacks {
-private:
-    bool connected = false;
 public:
+    bool connected = false;
     void onConnect(NimBLEClient *pClient) override;
     void onDisconnect(NimBLEClient *pClient) override;
-    bool isConnected();
 };
 
-// Security/pairing callbacks (mirror the original passkey behaviour).
-class CanonSecurityCallbacks : public NimBLESecurityCallbacks {
+// Mirrors the original SecurityCallback: passkey 123456, auto-confirm PIN
+class CanonSecurityCallbacks : public NimBLEAuthenticationCallbacks {
 public:
-    uint32_t onPassKeyRequest(NimBLESecurity *pSecurity) override;
-    bool onConfirmPIN(uint32_t pin) override;
-    bool onSecurityRequest() override;
-    void onAuthenticationComplete(NimBLEAuthComplete *pComplete) override;
+    uint32_t onPassKeyRequest(NimBLEDevice *pDevice) override;
+    bool onConfirmPIN(NimBLEDevice *pDevice) override;
+    void onSecurityStatus(NimBLEDevice *pDevice, NimBLESecurityStatus status) override;
+};
+
+// Scan filter: matches the Canon remote service UUID (name "Canon" as fallback)
+class CanonScanCallback : public NimBLEAdvertisedDeviceCallbacks {
+public:
+    CanonBLERemote *owner = nullptr;
+    void onResult(const NimBLEAdvertisedDevice &adv) override;
 };
 
 class CanonBLERemote {
 private:
-    const uint8_t BUTTON_RELEASE = 0b10000000;
-    const uint8_t BUTTON_FOCUS   = 0b01000000;
-    const uint8_t BUTTON_TELE    = 0b00100000;
-    const uint8_t BUTTON_WIDE    = 0b00010000;
-    const uint8_t MODE_IMMEDIATE = 0b00001100;
-    const uint8_t MODE_DELAY     = 0b00000100;
-    const uint8_t MODE_MOVIE     = 0b00001000;
+    // Trigger command bits (BR-E1 protocol)
+    const byte BUTTON_RELEASE = 0b10000000;
+    const byte BUTTON_FOCUS = 0b01000000;
+    const byte BUTTON_TELE = 0b00100000;
+    const byte BUTTON_WIDE = 0b00010000;
+    const byte MODE_IMMEDIATE = 0b00001100;
+    const byte MODE_DELAY = 0b00000100;
+    const byte MODE_MOVIE = 0b00001000;
 
     const NimBLEUUID SERVICE_UUID;
     const NimBLEUUID PAIRING_SERVICE;
     const NimBLEUUID SHUTTER_CONTROL_SERVICE;
 
+    // Created in init(): NimBLE requires NimBLEDevice::init() before createClient()
     NimBLEClient *pclient = nullptr;
     CanonClientCallbacks *pconnection_state = nullptr;
-    CanonScanCallbacks *pScanCallbacks = nullptr;
+    CanonSecurityCallbacks *psecurity_callbacks = nullptr;
+    CanonScanCallback *pscan_callback = nullptr;
     NimBLEAddress camera_address;
-    NimBLERemoteService *pRemoteService = nullptr;
     NimBLECharacteristic *pRemoteCharacteristic_Pairing = nullptr;
     NimBLECharacteristic *pRemoteCharacteristic_Trigger = nullptr;
     ArduinoNvs nvs;
 
     bool ready_to_connect = false;
-    bool cameraPaired = false;
-    std::string device_name = "";
+    String device_name = "";
 
+    bool handleAdvertised(const NimBLEAdvertisedDevice &adv);
     void scan(unsigned int scan_duration);
     void disconnect();
 
 public:
-    CanonBLERemote(std::string name);
+    CanonBLERemote(String name);
     void init();
     bool pair(unsigned int scan_duration);
-    bool connect();          // direct connect to stored MAC (no scan) — public for boot auto-connect
+    bool connect();   // public (was private in the original): direct connect to stored MAC, no scan
     bool isConnected();
     bool trigger();
     bool focus();
-    bool hasPairedCamera();
     NimBLEAddress getPairedAddress();
-    std::string getPairedAddressString();
+    String getPairedAddressString();
 };
 
 #endif
