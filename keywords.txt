@@ -11,18 +11,19 @@ ESP32-Canon-BLE-Remote	KEYWORD3
 # Datatypes (KEYWORD1)
 #######################################
 
-CanonBLERemote	KEYWORD1
+CanonBLERemote	KEYWORD_CLASS
 
 #######################################
 # Methods and Functions (KEYWORD2)
 #######################################
 
-init	KEYWORD2
-pair	KEYWORD2
-isConnected	KEYWORD2
+init	KEYWORD_MEMBER_FUNCTION
+pair	KEYWORD_MEMBER_FUNCTION
+connect	KEYWORD_MEMBER_FUNCTION
+isConnected	KEYWORD_MEMBER_FUNCTION
 
-trigger	KEYWORD2
-focus	KEYWORD2
+trigger	KEYWORD_MEMBER_FUNCTION
+focus	KEYWORD_MEMBER_FUNCTION
 
-getPairedAddress	KEYWORD2
-getPairedAddressString	KEYWORD2
+getPairedAddress	KEYWORD_MEMBER_FUNCTION
+getPairedAddressString	KEYWORD_MEMBER_FUNCTION
