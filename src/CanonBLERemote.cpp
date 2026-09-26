@@ -1,5 +1,4 @@
 #include "CanonBLERemote.h"
-#include <esp_mac.h>
 
 static const char *LOG_TAG = "CanoNimBLE";
 
@@ -10,29 +9,33 @@ void CanonClientCallbacks::onConnect(NimBLEClient *pClient) {
     log_i("Connected to camera");
 }
 
-void CanonClientCallbacks::onDisconnect(NimBLEClient *pClient) {
-    connected = false;
-    log_i("Disconnected from camera");
+void CanonClientCallbacks::onConnectFail(NimBLEClient *pClient, int reason) {
+    log_w("Connect failed, reason %d", reason);
 }
 
-uint32_t CanonSecurityCallbacks::onPassKeyRequest(NimBLEDevice *pDevice) {
-    log_i("Passkey request -> auto-reply 123456");
+void CanonClientCallbacks::onDisconnect(NimBLEClient *pClient, int reason) {
+    connected = false;
+    log_i("Disconnected from camera, reason %d", reason);
+}
+
+uint32_t CanonClientCallbacks::onPassKeyDisplay(NimBLEConnInfo &connInfo) {
+    log_i("Passkey display -> 123456");
     return 123456;
 }
 
-bool CanonSecurityCallbacks::onConfirmPIN(NimBLEDevice *pDevice) {
-    // Mirror of the original: give the camera's screen ~5 s, then auto-confirm
-    log_i("PIN confirm -> auto-accept after 5 s");
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    return true;
+void CanonClientCallbacks::onConfirmPasskey(NimBLEConnInfo &connInfo, uint32_t pin) {
+    // Auto-accept. Do NOT vTaskDelay here: this runs on the NimBLE host task,
+    // and blocking it stalls all BLE processing (the classic stack's 5 s delay
+    // is not portable to NimBLE).
+    log_i("Confirm passkey %u -> accept", (unsigned)pin);
 }
 
-void CanonSecurityCallbacks::onSecurityStatus(NimBLEDevice *pDevice, NimBLESecurityStatus status) {
-    log_i("Security status: %d", (int)status);
+void CanonClientCallbacks::onAuthenticationComplete(NimBLEConnInfo &connInfo) {
+    log_i("Authentication complete");
 }
 
-void CanonScanCallback::onResult(const NimBLEAdvertisedDevice &adv) {
-    if (owner) owner->handleAdvertised(adv);
+void CanonScanCallback::onResult(const NimBLEAdvertisedDevice *adv) {
+    if (owner && adv) owner->handleAdvertised(*adv);
 }
 
 // ------------------------------------------------------------------- class
@@ -47,24 +50,15 @@ CanonBLERemote::CanonBLERemote(String name)
 
 void CanonBLERemote::init() {
     if (!NimBLEDevice::isInitialized()) {
-        // Configure BEFORE init() so the settings take effect at bring-up
-        NimBLEDevice::setPower(DBM_0);   // cap TX power; camera is ~1-3 m away
-        NimBLEDevice::setSecurityPin("123456");
-        NimBLEDevice::setIOCap(NIMBLE_IO_CAP_KEYBOARD | NIMBLE_IO_CAP_DISPLAY);
-        psecurity_callbacks = new CanonSecurityCallbacks();
-        NimBLEDevice::setSecurityCallbacks(psecurity_callbacks);
-
-        // Present the public MAC (same as the classic stack) so any existing
-        // camera-side bond still matches. If your NimBLE-Arduino version lacks
-        // setAddress(), delete these 3 lines and do a one-time re-pair instead.
-        uint8_t mac[6];
-        esp_efuse_mac_get_default(mac);
-        NimBLEDevice::setAddress(mac);
-
+        // Configure BEFORE init() so the settings take effect at bring-up.
+        // 2.5.x API: setSecurityAuth(bonding, mitm, sc) + setSecurityPasskey().
+        NimBLEDevice::setSecurityAuth(true, true, true);   // bonding + MITM + SC
+        NimBLEDevice::setSecurityPasskey(123456);
         if (!NimBLEDevice::init(device_name.c_str())) {
             log_e("NimBLE init failed");
             return;
         }
+        NimBLEDevice::setPower(0);   // cap TX power at 0 dBm; camera is ~1-3 m away
         log_i("NimBLE ready");
     }
 
@@ -98,9 +92,9 @@ void CanonBLERemote::init() {
 void CanonBLERemote::scan(unsigned int scan_duration) {
     log_i("Start BLE scan");
     NimBLEScan *pBLEScan = NimBLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(pscan_callback);
+    pBLEScan->setScanCallbacks(pscan_callback);   // 2.5.x name (was setAdvertisedDeviceCallbacks)
     pBLEScan->setActiveScan(true);
-    pBLEScan->start(scan_duration, false);   // finite scan, auto-stops
+    pBLEScan->start(scan_duration, false);        // finite scan, auto-stops
 }
 
 bool CanonBLERemote::handleAdvertised(const NimBLEAdvertisedDevice &adv) {
@@ -125,6 +119,10 @@ String CanonBLERemote::getPairedAddressString() {
     return String(camera_address.toString().c_str());
 }
 
+bool CanonBLERemote::hasPairedCamera() {
+    return !camera_address.isEmpty();
+}
+
 /**
  * Scan and pair a camera. Call only when pairing a new/changed camera
  * (camera in Bluetooth Function -> Remote -> pairing screen).
@@ -136,7 +134,7 @@ bool CanonBLERemote::pair(unsigned int scan_duration) {
     scan(scan_duration);
 
     unsigned long start_ms = millis();
-    while (!ready_to_connect && millis() - start_ms < scan_duration * 1000UL) {
+    while (!ready_to_connect && millis() - start_ms < (unsigned long)scan_duration * 1000UL) {
         delay(10);   // was an empty spin-loop in the original
     }
 
@@ -148,12 +146,7 @@ bool CanonBLERemote::pair(unsigned int scan_duration) {
 
     log_i("Pairing..");
     if (pclient->connect(camera_address)) {
-        // Legacy pairing + MITM, mirroring the original's ENCRYPT_MITM window.
-        // (If your NimBLE version lacks encrypt(), delete this line — the
-        // camera's pairing mode usually initiates security on its own.)
-        pclient->encrypt(true, false, false);
-
-        NimBLEService *pRemoteService = pclient->getService(SERVICE_UUID);
+        NimBLERemoteService *pRemoteService = pclient->getService(SERVICE_UUID);
         if (pRemoteService != nullptr) {
             pRemoteCharacteristic_Pairing = pRemoteService->getCharacteristic(PAIRING_SERVICE);
             if (pRemoteCharacteristic_Pairing != nullptr) {
@@ -200,7 +193,7 @@ bool CanonBLERemote::connect() {
         // The camera may reject the request; negotiated params then stay.
         pclient->updateConnParams(400, 800, 0, 500);
 
-        NimBLEService *pRemoteService = pclient->getService(SERVICE_UUID);
+        NimBLERemoteService *pRemoteService = pclient->getService(SERVICE_UUID);
         if (pRemoteService != nullptr) {
             pRemoteCharacteristic_Trigger = pRemoteService->getCharacteristic(SHUTTER_CONTROL_SERVICE);
             if (pRemoteCharacteristic_Trigger != nullptr) {
