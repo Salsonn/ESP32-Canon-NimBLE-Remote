@@ -8,13 +8,13 @@
 ESP32-Canon-BLE-Remote	KEYWORD3
 
 #######################################
-# Datatypes (KEYWORD1)
+# Datatypes (KEYWORD_CLASS)
 #######################################
 
 CanonBLERemote	KEYWORD_CLASS
 
 #######################################
-# Methods and Functions (KEYWORD2)
+# Methods and Functions (KEYWORD_MEMBER_FUNCTION)
 #######################################
 
 init	KEYWORD_MEMBER_FUNCTION
