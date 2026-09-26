@@ -1,298 +1,182 @@
 #include "CanonBLERemote.h"
-#include <Arduino.h>
-#include <BLEDevice.h>
+#include <esp_bt.h>   // esp_ble_tx_power_set (controller-level; works under NimBLE on ESP32)
 
-static const char *LOG_TAG = "MySecurity";
+static const char *LOG_TAG = "CanonBLE";
 
-advdCallback::advdCallback(BLEUUID service_uuid, bool *ready_to_connect, BLEAddress *address_to_connect)
-{
-    service_uuid_wanted = service_uuid;
-    pready_to_connect = ready_to_connect;
-    paddress_to_connect = address_to_connect;
-}
+CanonScanCallbacks::CanonScanCallbacks(NimBLEUUID service_uuid, bool *ready, NimBLEAddress *address)
+    : service_uuid_wanted(service_uuid), pready_to_connect(ready), paddress_to_connect(address) {}
 
-void advdCallback::onResult(BLEAdvertisedDevice advertisedDevice)
-{
-    if (advertisedDevice.haveServiceUUID())
-    { //Check if device has service UUID available.
-        if (service_uuid_wanted.equals(advertisedDevice.getServiceUUID()))
-        {
-            *paddress_to_connect = advertisedDevice.getAddress();
+void CanonScanCallbacks::onResult(NimBLEAdvertisedDevice *advertisedDevice) {
+    if (advertisedDevice->haveServiceUUID()) {
+        if (service_uuid_wanted.equals(advertisedDevice->getServiceUUID())) {
+            *paddress_to_connect = advertisedDevice->getAddress();
             *pready_to_connect = true;
-            advertisedDevice.getScan()->stop();
+            NimBLEDevice::getScan()->stop();
         }
     }
 }
 
-void ConnectivityState::onConnect(BLEClient *pclient)
-{
-    // Serial.println("Device is connected");
-    connected = true;
+void CanonClientCallbacks::onConnect(NimBLEClient *pClient)    { connected = true; }
+void CanonClientCallbacks::onDisconnect(NimBLEClient *pClient) { connected = false; }
+bool CanonClientCallbacks::isConnected()                        { return connected; }
+
+uint32_t CanonSecurityCallbacks::onPassKeyRequest(NimBLESecurity *pSecurity) { return 123456; }
+bool CanonSecurityCallbacks::onConfirmPIN(uint32_t pin) { (void)pin; return true; }
+bool CanonSecurityCallbacks::onSecurityRequest() { return true; }
+void CanonSecurityCallbacks::onAuthenticationComplete(NimBLEAuthComplete *pComplete) {
+    if (pComplete->success) ESP_LOGI(LOG_TAG, "Pairing success");
+    else ESP_LOGE(LOG_TAG, "Pairing failed (status %d)", pComplete->status);
 }
 
-void ConnectivityState::onDisconnect(BLEClient *pclient)
-{
-    // Serial.println("Device disconnnect");
-    connected = false;
-}
-
-bool ConnectivityState::isConnected()
-{
-    return connected;
-}
-
-class SecurityCallback : public BLESecurityCallbacks
-{
-
-    uint32_t onPassKeyRequest()
-    {
-        return 123456;
-    }
-    void onPassKeyNotify(uint32_t pass_key)
-    {
-        ESP_LOGE(LOG_TAG, "The passkey Notify number:%d", pass_key);
-    }
-    bool onConfirmPIN(uint32_t pass_key)
-    {
-        ESP_LOGI(LOG_TAG, "The passkey YES/NO number:%d", pass_key);
-        vTaskDelay(5000);
-        return true;
-    }
-    bool onSecurityRequest()
-    {
-        ESP_LOGI(LOG_TAG, "Security Request");
-        return true;
-    }
-    void onAuthenticationComplete(esp_ble_auth_cmpl_t auth_cmpl)
-    {
-        if (auth_cmpl.success)
-        {
-            ESP_LOGI(LOG_TAG, "remote BD_ADDR:");
-            esp_log_buffer_hex(LOG_TAG, auth_cmpl.bd_addr, sizeof(auth_cmpl.bd_addr));
-            ESP_LOGI(LOG_TAG, "address type = %d", auth_cmpl.addr_type);
-        }
-        ESP_LOGI(LOG_TAG, "pair status = %s", auth_cmpl.success ? "success" : "fail");
-    }
-};
-
-CanonBLERemote::CanonBLERemote(String name) : SERVICE_UUID("00050000-0000-1000-0000-d8492fffa821"),
-                                              PAIRING_SERVICE("00050002-0000-1000-0000-d8492fffa821"),
-                                              SHUTTER_CONTROL_SERVICE("00050003-0000-1000-0000-d8492fffa821")
+CanonBLERemote::CanonBLERemote(std::string name)
+    : SERVICE_UUID("00050000-0000-1000-0000-d8492fffa821"),
+      PAIRING_SERVICE("00050002-0000-1000-0000-d8492fffa821"),
+      SHUTTER_CONTROL_SERVICE("00050003-0000-1000-0000-d8492fffa821")
 {
     device_name = name;
-    // Add our connection callback for state tracking.
+}
+
+void CanonBLERemote::init() {
+    NimBLEDevice::init(device_name.c_str());
+
+    // Bond + MITM + Secure Connections; auto-answer passkey requests with 123456.
+    NimBLEDevice::setSecurityIOCap(ESP_IO_CAP_KEYBOARD);
+    NimBLEDevice::setSecurityAuth(ESP_LE_AUTH_BOND | ESP_LE_AUTH_MITM | ESP_LE_AUTH_SC);
+    NimBLEDevice::setSecurityPasskey(123456);
+    NimBLEDevice::setSecurityInitEncrypted(true);
+    NimBLEDevice::setSecuritySC(true);
+    NimBLEDevice::setSecurityBonds(true);
+    NimBLEDevice::setSecurityCallbacks(new CanonSecurityCallbacks());
+
+    pclient = NimBLEDevice::createClient();
+    pconnection_state = new CanonClientCallbacks();
     pclient->setClientCallbacks(pconnection_state);
-}
+    pScanCallbacks = new CanonScanCallbacks(SERVICE_UUID, &ready_to_connect, &camera_address);
 
-void CanonBLERemote::init()
-{
-    BLEDevice::init(device_name.c_str());
-    BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT_NO_MITM);
-    BLEDevice::setSecurityCallbacks(new SecurityCallback());
+    // Cap TX power: camera is ~1-3 m away, 0 dBm is plenty.
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL, ESP_BLE_PWR_TYPE_0DBM);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,     ESP_BLE_PWR_TYPE_0DBM);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN,    ESP_BLE_PWR_TYPE_0DBM);
 
-    if (nvs.begin())
-    {
-        log_e("Initialize NVS Success");
-        String address = nvs.getString("cameraaddr");
-
-        if (address.length() == 17)
-        {
-            // Serial.printf("Paired camera address: %s\n", address.c_str());
-            camera_address = BLEAddress(address.c_str());
+    if (nvs.begin()) {
+        std::string address = nvs.getString("cameraaddr").c_str();
+        if (address.length() == 17) {
+            camera_address = NimBLEAddress::fromString(address);
+            cameraPaired = true;
+            ESP_LOGI(LOG_TAG, "Paired camera: %s", address.c_str());
+        } else {
+            ESP_LOGI(LOG_TAG, "No camera paired yet.");
         }
-        else
-        {
-            // Serial.println("No camera has been paired yet.");
-        }
-    }
-    else
-    {
-        log_e("Initialize NVS Failed");
+    } else {
+        ESP_LOGE(LOG_TAG, "NVS init failed");
     }
 }
 
-// Purpose : Scanning for new BLE devices around.
-//           When found -> advdCallback::OnResult
-void CanonBLERemote::scan(unsigned int scan_duration)
-{
-
-    log_i("Start BLE scan");
-    BLEScan *pBLEScan = BLEDevice::getScan();
-    advdCallback *advert_dev_callback = new advdCallback(SERVICE_UUID, &ready_to_connect, &camera_address);
-
-    pBLEScan->setAdvertisedDeviceCallbacks(advert_dev_callback); // Retrieve a Scanner and set the callback we want to use to be informed when we have detected a new device.
+void CanonBLERemote::scan(unsigned int scan_duration) {
+    ESP_LOGI(LOG_TAG, "Start BLE scan");
+    NimBLEScan *pBLEScan = NimBLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(pScanCallbacks);
     pBLEScan->setActiveScan(true);
-    pBLEScan->start(scan_duration); // Specify that we want active scanning and start the scan to run for 30 seconds.
+    ready_to_connect = false;
+    pBLEScan->start(scan_duration, false, true);   // timed scan, notify per result
 }
 
-BLEAddress CanonBLERemote::getPairedAddress()
-{
-    return camera_address;
-}
+NimBLEAddress CanonBLERemote::getPairedAddress() { return camera_address; }
+std::string CanonBLERemote::getPairedAddressString() { return camera_address.toString(); }
+bool CanonBLERemote::hasPairedCamera() { return cameraPaired; }
 
-String CanonBLERemote::getPairedAddressString()
-{
-    return String(camera_address.toString().c_str());
-}
-
-/**
- *  Scan and pair camera 
- * 
- *  This function should be called only when you want to pair with the new camera, and the camera is in remote paring screen.
- *  After paired, camera mac address will be stored in ESP32 NVS for later connection use.
- * 
- *  @param  scan_duration : Scan duration in seconds
- */
-
-bool CanonBLERemote::pair(unsigned int scan_duration)
-{
-    BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT_MITM);
-    log_i("Scanning for camera...");
+bool CanonBLERemote::pair(unsigned int scan_duration) {
+    ESP_LOGI(LOG_TAG, "Scanning for camera...");
     scan(scan_duration);
     unsigned long start_ms = millis();
-    while (!ready_to_connect && millis() - start_ms < scan_duration * 1000)
-    {
+    while (!ready_to_connect && millis() - start_ms < scan_duration * 1000) {
+        delay(10);   // was an empty spin in the classic version
     }
 
-    if (ready_to_connect)
-    {
-        log_i("Canon device found");
-        // Serial.println(camera_address.toString().c_str());
-    }
-    else
-    {
-        log_i("Camera not found");
+    if (!ready_to_connect) {
+        ESP_LOGI(LOG_TAG, "Camera not found");
         return false;
     }
+    ESP_LOGI(LOG_TAG, "Canon device found: %s", camera_address.toString().c_str());
 
-    // Pair camera
-    log_i("Pairing..");
-    if (pclient->connect(camera_address))
-    {
-        // Acquire reference to main service
-        pRemoteService = pclient->getService(SERVICE_UUID);
-        if (pRemoteService != nullptr)
-        {
-            // Acquire reference to BLE characteristics
+    if (pclient->connect(camera_address)) {   // triggers the passkey pairing exchange
+        pRemoteService = pclient->getServiceByUUID(SERVICE_UUID);
+        if (pRemoteService != nullptr) {
             pRemoteCharacteristic_Pairing = pRemoteService->getCharacteristic(PAIRING_SERVICE);
-            if ((pRemoteCharacteristic_Pairing != nullptr))
-            {
-                // Send request on pairing service from external device
-                String device_name_ = " " + device_name + " ";          //Pairing message to send
-                byte cmdPress[device_name_.length()];                   // Stocking list of Bytes char of the message
-                device_name_.getBytes(cmdPress, device_name_.length()); // message Parser
-                cmdPress[0] = {0x03};
-                pRemoteCharacteristic_Pairing->writeValue(cmdPress, sizeof(cmdPress), false); // Writing to Canon_pairing_service
-                log_e("Camera paring success");
+            if (pRemoteCharacteristic_Pairing != nullptr) {
+                // Register this remote with the camera: 0x03 + space-padded name.
+                std::string name_ = " " + device_name + " ";
+                std::string payload(name_.size(), 0);
+                payload[0] = 0x03;
+                for (size_t i = 1; i < name_.size(); i++) payload[i] = name_[i];
+                pRemoteCharacteristic_Pairing->write(payload, false);
+                ESP_LOGI(LOG_TAG, "Pairing write sent");
                 delay(200);
                 disconnect();
-                BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT_NO_MITM);
                 delay(200);
-                connect();
-                nvs.setString("cameraaddr", String(camera_address.toString().c_str()));
-                if (nvs.commit())
-                {
-                    log_i("Saving camera's address to NVS success");
+                connect();   // reconnect now that the camera has bonded us
+                nvs.setString("cameraaddr", camera_address.toString());
+                if (nvs.commit()) {
+                    ESP_LOGI(LOG_TAG, "Saved camera address");
                     return true;
                 }
-                else
-                {
-                    log_e("Storing camera's address to NVS failed");
-                    return false;
-                }
+                ESP_LOGE(LOG_TAG, "Saving camera address failed");
+                return false;
             }
-            else
-            {
-                log_e("Couldn't acquire the pairing or shutter service");
-            }
+            ESP_LOGE(LOG_TAG, "Couldn't acquire pairing service");
+        } else {
+            ESP_LOGE(LOG_TAG, "Couldn't acquire remote main service");
         }
-        else
-        {
-            log_e("Couldn't acquire the remote main service");
-        }
-    }
-    else
-    {
-        log_e("Couldn't connect the BLEClient to the device");
+    } else {
+        ESP_LOGE(LOG_TAG, "Couldn't connect to camera");
     }
     return false;
 }
 
-bool CanonBLERemote::connect()
-{
-    if (pclient->connect(camera_address))
-    {
-        pRemoteService = pclient->getService(SERVICE_UUID);
-        if (pRemoteService != nullptr)
-        {
-            // Serial.println("Get remote service OK");
+bool CanonBLERemote::connect() {
+    if (pclient->connect(camera_address)) {
+        pRemoteService = pclient->getServiceByUUID(SERVICE_UUID);
+        if (pRemoteService != nullptr) {
             pRemoteCharacteristic_Trigger = pRemoteService->getCharacteristic(SHUTTER_CONTROL_SERVICE);
-            if (pRemoteCharacteristic_Trigger != nullptr)
-            {
-                log_i("Camera connection Success");
-                // disconnect();       // Disconnect remote from the camera every time after action, as the real canon remote did.
+            if (pRemoteCharacteristic_Trigger != nullptr) {
+                ESP_LOGI(LOG_TAG, "Camera connection success");
+                // Long connection interval so the radio (and CPU) sleep between events.
+                NimBLEDevice::updateConnectionParameters(
+                    pclient->getConnId(),
+                    400,    // min 500 ms  (1.25 ms units)
+                    800,    // max 1000 ms
+                    0,      // latency
+                    5000);  // supervision timeout (ms)
                 return true;
             }
-            else
-            {
-                log_e("Get trigger service failed");
-            }
-        }
-        else
-        {
-            log_e("Couldn't acquire the remote main service");
+            ESP_LOGE(LOG_TAG, "Get trigger service failed");
+        } else {
+            ESP_LOGE(LOG_TAG, "Couldn't acquire remote main service");
         }
         disconnect();
     }
     return false;
 }
 
-void CanonBLERemote::disconnect()
-{
-    pclient->disconnect();
-}
+void CanonBLERemote::disconnect() { pclient->disconnect(); }
 
-bool CanonBLERemote::isConnected()
-{
-    return pconnection_state->isConnected();
-}
+bool CanonBLERemote::isConnected() { return pconnection_state->isConnected(); }
 
-/** Trigger Camera 
- *  If the camera is in photo mode, it will take a single picture.
- *  If the camera is in movie mode, it will start/stop movie recording. 
- */
-
-bool CanonBLERemote::trigger()
-{
-
-    if (!isConnected())
-    {
-        if (!connect())
-        {
-            return false;
-        }
-    }
-
-    byte cmdByte = {MODE_IMMEDIATE | BUTTON_RELEASE};          // Binary OR : Concatenate Mode and Button
-    pRemoteCharacteristic_Trigger->writeValue(cmdByte, false); // Set the characteristic's value to be the array of bytes that is actually a string.
+bool CanonBLERemote::trigger() {
+    if (!isConnected() && !connect()) return false;
+    uint8_t cmd = MODE_IMMEDIATE | BUTTON_RELEASE;
+    pRemoteCharacteristic_Trigger->write(std::string(1, (char)cmd), false);
     delay(200);
-    pRemoteCharacteristic_Trigger->writeValue(MODE_IMMEDIATE, false);
+    pRemoteCharacteristic_Trigger->write(std::string(1, (char)MODE_IMMEDIATE), false);
     delay(50);
     return true;
 }
 
-bool CanonBLERemote::focus()
-{
-    if (!isConnected())
-    {
-        if (!connect())
-        {
-            return false;
-        }
-    }
-    byte cmdByte[] = {MODE_IMMEDIATE | BUTTON_FOCUS};                    // Binary OR : Concatenate Mode and Button
-    pRemoteCharacteristic_Trigger->writeValue(cmdByte, sizeof(cmdByte)); // Set the characteristic's value to be the array of bytes that is actually a string.
+bool CanonBLERemote::focus() {
+    if (!isConnected() && !connect()) return false;
+    uint8_t cmd = MODE_IMMEDIATE | BUTTON_FOCUS;
+    pRemoteCharacteristic_Trigger->write(std::string(1, (char)cmd), false);
     delay(200);
-    pRemoteCharacteristic_Trigger->writeValue(MODE_IMMEDIATE, sizeof(MODE_IMMEDIATE));
+    pRemoteCharacteristic_Trigger->write(std::string(1, (char)MODE_IMMEDIATE), false);
     return true;
 }
