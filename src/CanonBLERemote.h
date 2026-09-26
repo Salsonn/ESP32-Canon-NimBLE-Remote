@@ -31,6 +31,8 @@ public:
 
 class CanonBLERemote {
 private:
+    friend class CanonScanCallback;   // lets the scan callback call handleAdvertised()
+
     // Trigger command bits (BR-E1 protocol)
     const byte BUTTON_RELEASE = 0b10000000;
     const byte BUTTON_FOCUS   = 0b01000000;
